@@ -8,6 +8,7 @@
     "dev": "vite",
     "build": "vite build",
     "lint": "eslint .",
+    "test": "node --test src/execution/executionController.test.js src/execution/previewDocument.test.js",
     "preview": "vite preview"
   },
   "dependencies": {

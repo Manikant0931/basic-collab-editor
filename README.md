@@ -87,6 +87,36 @@ Example response:
 }
 ```
 
+## Browser Execution and Preview
+
+- JavaScript files run in a disposable Web Worker in the current browser. The
+  worker captures console output, supports async/await, and is terminated after
+  five seconds or when Stop is pressed. `Ctrl+Enter` runs the active supported
+  file. Results remain local to the user who ran the code and are not written
+  to the shared Yjs document.
+- HTML files render in a sandboxed iframe with an opaque origin. The preview
+  allows scripts and forms, but does not grant same-origin access, popups,
+  downloads, or top-level navigation. A heartbeat watchdog removes a preview
+  that stops responding.
+- Relative linked CSS and classic JavaScript files are resolved from the
+  shared workspace folder tree. Local text SVGs and data-image URIs are
+  supported. Binary workspace assets, JavaScript module imports, and external
+  JavaScript are not bundled; unsupported references are reported in Console.
+  HTTPS styles and images may load, but preview network connections and form
+  submissions are blocked by policy.
+- The Worker hides common network and storage APIs, but browser Workers and
+  sandboxed frames are not complete security boundaries. They cannot guarantee
+  protection from every browser resource-exhaustion attack. Do not treat this
+  feature as a secure service for executing hostile code.
+
+Run the frontend unit tests from `Frontend/`:
+
+```bash
+npm test
+npm run lint
+npm run build
+```
+
 ## Run Locally
 
 ### Prerequisites

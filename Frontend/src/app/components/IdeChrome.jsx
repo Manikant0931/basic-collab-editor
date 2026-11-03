@@ -7,6 +7,7 @@ import {
   Code2,
   Copy,
   Download,
+  Eye,
   FileCode2,
   FolderOpen,
   GitBranch,
@@ -15,15 +16,19 @@ import {
   Play,
   Search,
   Settings,
+  Square,
   Terminal,
   Users,
   X,
 } from "lucide-react";
+import ExecutionPreview from "./ExecutionPreview.jsx";
 
 export function TopBar({
   room,
   saveState,
   onRun,
+  onStop,
+  isRunning,
   onShare,
   onImport,
   onExport,
@@ -91,10 +96,21 @@ export function TopBar({
           {copied ? <Check size={15} /> : <Copy size={15} />}
           <span>{copied ? "Copied" : "Share"}</span>
         </button>
-        <button className="run-button" type="button" onClick={onRun}>
-          <Play size={14} fill="currentColor" />
-          <span>Run</span>
-        </button>
+        {isRunning ? (
+          <button
+            className="run-button stop-button"
+            type="button"
+            onClick={onStop}
+          >
+            <Square size={12} fill="currentColor" />
+            <span>Stop</span>
+          </button>
+        ) : (
+          <button className="run-button" type="button" onClick={onRun}>
+            <Play size={14} fill="currentColor" />
+            <span>Run</span>
+          </button>
+        )}
       </div>
       <div className="profile-menu" title={username}>
         <span className="avatar current-user">{initials}</span>
@@ -263,8 +279,14 @@ export function BottomPanel({
   onTabChange,
   height,
   onResize,
-  notice,
+  executionEvents,
+  executionState,
+  previewSrcDoc,
+  previewRunId,
+  previewFrameRef,
+  onPreviewLoad,
   onClear,
+  onStop,
   onClose,
 }) {
   return (
@@ -278,7 +300,8 @@ export function BottomPanel({
       <div className="bottom-panel-header">
         <div className="panel-tabs">
           {[
-            { id: "output", label: "Output", icon: <Activity size={14} /> },
+            { id: "console", label: "Console", icon: <Activity size={14} /> },
+            { id: "preview", label: "Preview", icon: <Eye size={14} /> },
             {
               id: "problems",
               label: "Problems",
@@ -299,7 +322,13 @@ export function BottomPanel({
           ))}
         </div>
         <div className="panel-tools">
-          <button type="button" title="Clear output" onClick={onClear}>
+          {executionState === "running" && (
+            <button type="button" title="Stop execution" onClick={onStop}>
+              <Square size={12} fill="currentColor" />
+              <span>Stop</span>
+            </button>
+          )}
+          <button type="button" title="Clear console" onClick={onClear}>
             <X size={14} />
             <span>Clear</span>
           </button>
@@ -309,19 +338,36 @@ export function BottomPanel({
         </div>
       </div>
       <div
-        className={`bottom-panel-content ${tab === "terminal" ? "terminal-content" : ""}`}
+        className={`bottom-panel-content ${tab === "terminal" ? "terminal-content" : ""} ${tab === "preview" ? "preview-panel-content" : ""}`}
       >
-        {tab === "output" && (
-          <p className="panel-message">
-            {notice ||
-              "Execution is not available in this frontend-only phase."}
-          </p>
+        {tab === "console" && (
+          <div className="console-output" aria-live="polite">
+            {!executionEvents.length && (
+              <p className="panel-message">
+                Run JavaScript to see console output here.
+              </p>
+            )}
+            {executionEvents.map((event, index) => (
+              <ConsoleEntry
+                key={`${event.runId || "local"}-${index}`}
+                event={event}
+              />
+            ))}
+          </div>
         )}
         {tab === "problems" && (
           <p className="panel-message">
             Diagnostics are not connected in this phase.
           </p>
         )}
+        <div className="preview-pane" hidden={tab !== "preview"}>
+          <ExecutionPreview
+            srcDoc={previewSrcDoc}
+            runId={previewRunId}
+            frameRef={previewFrameRef}
+            onLoad={onPreviewLoad}
+          />
+        </div>
         {tab === "terminal" && (
           <>
             <span className="terminal-prompt">$</span>
@@ -333,6 +379,63 @@ export function BottomPanel({
       </div>
     </section>
   );
+}
+
+function ConsoleEntry({ event }) {
+  if (event.type === "log") {
+    return (
+      <div className={`console-row console-${event.level}`}>
+        <span className="console-kind">{event.level}</span>
+        <pre>{event.args.map(formatConsoleValue).join(" ")}</pre>
+      </div>
+    );
+  }
+
+  if (event.type === "runtime-error" || event.type === "worker-error") {
+    return (
+      <div className="console-row console-error">
+        <span className="console-kind">error</span>
+        <pre>{`${event.error.name}: ${event.error.message}${event.error.stack ? `\n${event.error.stack}` : ""}`}</pre>
+      </div>
+    );
+  }
+
+  let message = "";
+  if (event.type === "started") message = "Execution started";
+  else if (event.type === "complete") {
+    message = `Execution completed in ${Number(event.durationMs || 0).toFixed(1)} ms`;
+  } else if (event.type === "timeout") {
+    message = `Execution stopped after ${event.timeoutMs} ms timeout`;
+  } else if (event.type === "stopped") message = "Execution stopped";
+  else if (event.type === "preview-ready") message = "Preview loaded";
+  else if (event.type === "preview-responsive") message = "Preview responsive";
+  else if (event.type === "output-truncated") {
+    message = "Output limit reached; additional entries were omitted.";
+  } else if (event.type === "unsupported") message = event.message;
+  return message ? (
+    <div className={`console-status ${event.type}`} role="status">
+      {message}
+    </div>
+  ) : null;
+}
+
+function formatConsoleValue(value) {
+  if (value?.kind === "string") return value.value;
+  if (value?.kind === "undefined") return "undefined";
+  if (value?.kind === "null") return "null";
+  if (value?.kind === "error") return `${value.name}: ${value.message}`;
+  if (value?.kind === "circular") return "[Circular]";
+  if (value?.kind === "unavailable") return value.value;
+  if (value?.kind === "function") return `[Function ${value.value}]`;
+  if (value?.kind === "symbol") return value.value;
+  if (value?.kind === "bigint") return value.value;
+  if (value?.kind === "array") {
+    return JSON.stringify(value.value, null, 2);
+  }
+  if (value?.kind === "object") {
+    return JSON.stringify(value.value, null, 2);
+  }
+  return String(value?.value ?? value?.kind ?? value);
 }
 
 export function StatusBar({ language, position, connection, room }) {

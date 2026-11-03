@@ -2,6 +2,12 @@ import { Editor } from "@monaco-editor/react";
 import { Check, PanelBottomClose, PanelBottomOpen, X } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { MonacoBinding } from "y-monaco";
+import { ExecutionController } from "../execution/executionController.js";
+import { createRunId } from "../execution/executionProtocol.js";
+import {
+  buildCssPreviewDocument,
+  buildPreviewDocument,
+} from "../execution/previewDocument.js";
 import "./App.css";
 import Explorer from "./components/Explorer.jsx";
 import FileActionDialog from "./components/FileActionDialog.jsx";
@@ -20,6 +26,27 @@ import {
 
 const DEFAULT_ROOM = "monaco";
 const PREFERENCES_KEY = "browser-ide:preferences";
+const PREVIEW_WATCHDOG_MS = 5_000;
+
+function expirePreviewRun(runId, refs) {
+  if (refs.previewRunIdRef.current !== runId) return;
+  refs.previewRunIdRef.current = null;
+  window.clearTimeout(refs.previewTimerRef.current);
+  refs.setPreviewSrcDoc("");
+  refs.setExecutionState("timeout");
+  refs.setExecutionEvents((current) => [
+    ...current,
+    { type: "timeout", timeoutMs: PREVIEW_WATCHDOG_MS, runId },
+  ]);
+}
+
+function schedulePreviewWatchdog(runId, refs) {
+  window.clearTimeout(refs.previewTimerRef.current);
+  refs.previewTimerRef.current = window.setTimeout(
+    () => expirePreviewRun(runId, refs),
+    PREVIEW_WATCHDOG_MS,
+  );
+}
 
 function readPreferences() {
   try {
@@ -43,7 +70,7 @@ function App() {
   const [activeView, setActiveView] = useState("explorer");
   const [theme, setTheme] = useState("dark");
   const [minimap, setMinimap] = useState(true);
-  const [panelTab, setPanelTab] = useState("output");
+  const [panelTab, setPanelTab] = useState("console");
   const [panelOpen, setPanelOpen] = useState(true);
   const [panelHeight, setPanelHeight] = useState(210);
   const [sidebarWidth, setSidebarWidth] = useState(252);
@@ -53,13 +80,25 @@ function App() {
     lineNumber: 1,
     column: 1,
   });
-  const [runNotice, setRunNotice] = useState("");
+  const [executionState, setExecutionState] = useState("idle");
+  const [executionEvents, setExecutionEvents] = useState([]);
+  const [previewSrcDoc, setPreviewSrcDoc] = useState("");
+  const [previewRunId, setPreviewRunId] = useState(null);
   const [toast, setToast] = useState("");
   const [copied, setCopied] = useState(false);
   const [fileDialog, setFileDialog] = useState(null);
   const editorRef = useRef(null);
+  const activeFileIdRef = useRef(activeFileId);
+  const editorFileIdRef = useRef(null);
   const bindingRef = useRef(null);
   const fileInputRef = useRef(null);
+  const executionControllerRef = useRef(null);
+  const runHandlerRef = useRef(null);
+  const previewFrameRef = useRef(null);
+  const previewRunIdRef = useRef(null);
+  const previewTimerRef = useRef(null);
+  const previewHeartbeatSeenRef = useRef(false);
+  const previewOutputRef = useRef({ entries: 0, characters: 0 });
   const activeFile = workspace.files.find((file) => file.id === activeFileId);
   const activeLanguage = activeFile?.language || "javascript";
 
@@ -72,6 +111,90 @@ function App() {
     setPanelHeight(preferences.panelHeight || 210);
     setSidebarWidth(preferences.sidebarWidth || 252);
   }, []);
+
+  useEffect(() => {
+    const handlePreviewMessage = (event) => {
+      if (
+        event.source !== previewFrameRef.current?.contentWindow ||
+        event.data?.channel !== "codetogether-preview" ||
+        event.data.runId !== previewRunIdRef.current
+      ) {
+        return;
+      }
+
+      const data = event.data;
+      if (data.type === "heartbeat") {
+        if (!previewHeartbeatSeenRef.current) {
+          previewHeartbeatSeenRef.current = true;
+          setExecutionEvents((current) => [
+            ...current,
+            { type: "preview-responsive", runId: data.runId },
+          ]);
+        }
+        schedulePreviewWatchdog(data.runId, {
+          previewRunIdRef,
+          previewTimerRef,
+          setPreviewSrcDoc,
+          setExecutionState,
+          setExecutionEvents,
+        });
+        return;
+      }
+      if (data.type === "console") {
+        if (
+          !["log", "info", "warn", "error", "table", "debug"].includes(
+            data.level,
+          ) ||
+          !Array.isArray(data.args)
+        ) {
+          return;
+        }
+        let size;
+        try {
+          size = JSON.stringify(data.args).length;
+        } catch {
+          return;
+        }
+        if (
+          previewOutputRef.current.entries >= 300 ||
+          previewOutputRef.current.characters + size > 100_000
+        ) {
+          if (!previewOutputRef.current.truncated) {
+            previewOutputRef.current.truncated = true;
+            setExecutionEvents((current) => [
+              ...current,
+              { type: "output-truncated", runId: data.runId },
+            ]);
+          }
+          return;
+        }
+        previewOutputRef.current.entries += 1;
+        previewOutputRef.current.characters += size;
+        setExecutionEvents((current) => [
+          ...current,
+          {
+            type: "log",
+            runId: data.runId,
+            level: data.level,
+            args: data.args,
+          },
+        ]);
+      } else if (
+        data.type === "error" &&
+        typeof data.error?.message === "string"
+      ) {
+        setExecutionEvents((current) => [
+          ...current,
+          { type: "runtime-error", runId: data.runId, error: data.error },
+        ]);
+      }
+    };
+
+    window.addEventListener("message", handlePreviewMessage);
+    return () => window.removeEventListener("message", handlePreviewMessage);
+  }, []);
+
+  useEffect(() => () => window.clearTimeout(previewTimerRef.current), []);
 
   useEffect(() => {
     window.localStorage.setItem(
@@ -89,10 +212,11 @@ function App() {
 
   useEffect(() => {
     if (!workspace.files.some((file) => file.id === activeFileId)) {
-      setActiveFileId(
+      const fallbackFileId =
         workspace.files.find((file) => file.type === "file")?.id ||
-          ROOT_FILE_ID,
-      );
+        ROOT_FILE_ID;
+      activeFileIdRef.current = fallbackFileId;
+      setActiveFileId(fallbackFileId);
     }
   }, [activeFileId, workspace.files]);
 
@@ -118,9 +242,31 @@ function App() {
     return () => window.clearTimeout(timer);
   }, [toast]);
 
+  useEffect(() => {
+    const controller = new ExecutionController({
+      timeoutMs: 5_000,
+      onEvent: (event) => {
+        setExecutionEvents((current) => [...current, event].slice(-320));
+        if (event.type === "started") setExecutionState("running");
+        else if (event.type === "complete") setExecutionState("completed");
+        else if (event.type === "stopped") setExecutionState("stopped");
+        else if (event.type === "timeout") setExecutionState("timeout");
+        else if (["runtime-error", "worker-error"].includes(event.type)) {
+          setExecutionState("error");
+        }
+      },
+    });
+    executionControllerRef.current = controller;
+    return () => {
+      controller.dispose();
+      executionControllerRef.current = null;
+    };
+  }, []);
+
   const notify = useCallback((message) => setToast(message), []);
 
   const openFile = (fileId) => {
+    activeFileIdRef.current = fileId;
     setActiveFileId(fileId);
     setOpenFileIds((current) =>
       current.includes(fileId) ? current : [...current, fileId],
@@ -131,8 +277,10 @@ function App() {
     if (openFileIds.length < 2) return;
     const remaining = openFileIds.filter((id) => id !== fileId);
     setOpenFileIds(remaining);
-    if (activeFileId === fileId)
+    if (activeFileId === fileId) {
+      activeFileIdRef.current = remaining[remaining.length - 1];
       setActiveFileId(remaining[remaining.length - 1]);
+    }
   };
 
   const bindEditor = useCallback(
@@ -152,6 +300,7 @@ function App() {
   const handleEditorMount = useCallback(
     (editor) => {
       editorRef.current = editor;
+      editorFileIdRef.current = activeFile?.id || ROOT_FILE_ID;
       bindEditor(editor, activeFile?.id || ROOT_FILE_ID);
       editor.layout();
       editor.onDidChangeCursorPosition(({ position }) =>
@@ -175,7 +324,10 @@ function App() {
   useEffect(() => {
     const handleShortcut = (event) => {
       const command = event.ctrlKey || event.metaKey;
-      if (command && event.key.toLowerCase() === "s") {
+      if (command && event.key === "Enter") {
+        event.preventDefault();
+        runHandlerRef.current?.();
+      } else if (command && event.key.toLowerCase() === "s") {
         event.preventDefault();
         saveNow();
       } else if (command && event.shiftKey && event.key.toLowerCase() === "f") {
@@ -223,9 +375,134 @@ function App() {
   };
 
   const handleRun = () => {
-    setPanelTab("output");
+    if (executionState === "running") {
+      if (previewRunIdRef.current) {
+        window.clearTimeout(previewTimerRef.current);
+        previewRunIdRef.current = null;
+        setPreviewSrcDoc("");
+      } else {
+        executionControllerRef.current?.stop();
+      }
+    }
+    const executionFileId =
+      activeFileIdRef.current || editorFileIdRef.current || activeFileId;
+    const file = workspace.files.find((item) => item.id === executionFileId);
+    const isPreview = file?.language === "html" || file?.language === "css";
+    setPanelTab(isPreview ? "preview" : "console");
     setPanelOpen(true);
-    setRunNotice("Execution is not available in this frontend-only phase.");
+    setExecutionEvents([]);
+    window.clearTimeout(previewTimerRef.current);
+    previewRunIdRef.current = null;
+    setPreviewSrcDoc("");
+    if (!file || file.type !== "file") {
+      setExecutionState("error");
+      setExecutionEvents([
+        {
+          type: "unsupported",
+          message: "Select a file before running code.",
+        },
+      ]);
+      return;
+    }
+    const editorModel = editorRef.current?.getModel();
+    const code =
+      editorFileIdRef.current === file.id && editorModel
+        ? editorModel.getValue()
+        : workspace.getText(file.id).toString();
+
+    if (file.language === "html" || file.language === "css") {
+      const runId = createRunId();
+      try {
+        const result =
+          file.language === "html"
+            ? buildPreviewDocument({
+                html: code,
+                activeFileId: file.id,
+                files: workspace.files,
+                getText: workspace.getText,
+                runId,
+              })
+            : buildCssPreviewDocument(code, runId);
+        previewOutputRef.current = { entries: 0, characters: 0 };
+        previewHeartbeatSeenRef.current = false;
+        previewRunIdRef.current = runId;
+        setPreviewRunId(runId);
+        setPreviewSrcDoc(result.srcDoc);
+        setExecutionState("running");
+        setExecutionEvents([
+          { type: "started", runId },
+          ...result.warnings.map((message) => ({
+            type: "unsupported",
+            message,
+            runId,
+          })),
+        ]);
+        schedulePreviewWatchdog(runId, {
+          previewRunIdRef,
+          previewTimerRef,
+          setPreviewSrcDoc,
+          setExecutionState,
+          setExecutionEvents,
+        });
+      } catch (error) {
+        setExecutionState("error");
+        setExecutionEvents([
+          {
+            type: "runtime-error",
+            error: {
+              name: error.name || "PreviewError",
+              message: error.message || String(error),
+              stack: error.stack || "",
+            },
+          },
+        ]);
+      }
+      return;
+    }
+
+    if (file.language !== "javascript") {
+      setExecutionState("error");
+      setExecutionEvents([
+        {
+          type: "unsupported",
+          message: `JavaScript execution is not available for ${file.language}.`,
+        },
+      ]);
+      return;
+    }
+
+    executionControllerRef.current?.run(code);
+  };
+  runHandlerRef.current = handleRun;
+
+  const handleStop = () => {
+    if (executionState === "running" && previewRunIdRef.current) {
+      const runId = previewRunIdRef.current;
+      previewRunIdRef.current = null;
+      window.clearTimeout(previewTimerRef.current);
+      setPreviewSrcDoc("");
+      setExecutionState("stopped");
+      setExecutionEvents((current) => [...current, { type: "stopped", runId }]);
+      return;
+    }
+    executionControllerRef.current?.stop();
+  };
+
+  const handlePreviewLoad = () => {
+    const runId = previewRunIdRef.current;
+    if (!runId) return;
+    setExecutionState("completed");
+    setExecutionEvents((current) => [
+      ...current,
+      { type: "preview-ready", runId },
+    ]);
+    schedulePreviewWatchdog(runId, {
+      previewRunIdRef,
+      previewTimerRef,
+      setPreviewSrcDoc,
+      setExecutionState,
+      setExecutionEvents,
+    });
   };
 
   const handleCreateFile = (parentId) => {
@@ -255,7 +532,10 @@ function App() {
       workspace.renameItem(action.item, name);
     } else if (action.type === "delete") {
       workspace.deleteItem(action.item.id);
-      if (activeFileId === action.item.id) setActiveFileId(ROOT_FILE_ID);
+      if (activeFileId === action.item.id) {
+        activeFileIdRef.current = ROOT_FILE_ID;
+        setActiveFileId(ROOT_FILE_ID);
+      }
     }
     setFileDialog(null);
   };
@@ -384,6 +664,8 @@ function App() {
         room={room}
         saveState={workspace.saveState}
         onRun={handleRun}
+        onStop={handleStop}
+        isRunning={executionState === "running"}
         onShare={handleShare}
         onImport={() => fileInputRef.current?.click()}
         onExport={handleExport}
@@ -569,9 +851,21 @@ function App() {
               onTabChange={setPanelTab}
               height={panelHeight}
               onResize={beginPanelResize}
-              notice={runNotice}
-              onClear={() => setRunNotice("")}
-              onClose={() => setPanelOpen(false)}
+              executionEvents={executionEvents}
+              executionState={executionState}
+              previewSrcDoc={previewSrcDoc}
+              previewRunId={previewRunId}
+              previewFrameRef={previewFrameRef}
+              onPreviewLoad={handlePreviewLoad}
+              onClear={() => {
+                setExecutionEvents([]);
+                if (executionState !== "running") setExecutionState("idle");
+              }}
+              onStop={handleStop}
+              onClose={() => {
+                if (executionState === "running") handleStop();
+                setPanelOpen(false);
+              }}
             />
           ) : (
             <div className="collapsed-panel">
